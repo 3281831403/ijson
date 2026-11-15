@@ -275,5 +275,138 @@ class Stream(unittest.TestCase):
         self.assertEqual(next(l)[1], '{')
 
 
+# Bad samples and the exact exception type the pure python backend must raise.
+# Every error is an instance of common.JSONError so callers that only catch
+# JSONError never see a leaking UnicodeDecodeError, ValueError or RecursionError.
+PYTHON_ERROR_CASES = [
+    # truncated literal keywords -> incomplete data
+    (b'nu', common.IncompleteJSONError),
+    (b'tr', common.IncompleteJSONError),
+    (b'fals', common.IncompleteJSONError),
+    (b'[1, nu', common.IncompleteJSONError),
+    # truncated multibyte UTF-8 at EOF -> incomplete data
+    (b'"\xd1', common.IncompleteJSONError),
+    # malformed UTF-8 -> parse error
+    (b'["\xff"]', common.JSONError),
+    # bad escape and bare control characters -> parse error
+    (b'["\\x"]', common.JSONError),
+    (b'{"\\x": 1}', common.JSONError),
+    (b'["\x01"]', common.JSONError),
+    # NaN and other non-stdlib numbers -> parse error
+    (b'[nan]', common.JSONError),
+    (b'[+1]', common.JSONError),
+    (b'[01]', common.JSONError),
+    (b'[1.]', common.JSONError),
+    (b'[1e]', common.JSONError),
+    # garbage lexemes -> parse error
+    (b'invalid', common.JSONError),
+    (b'none', common.JSONError),
+    (b'nullx', common.JSONError),
+    # nesting beyond the limit -> parse error, never RecursionError
+    (b'[' * 2000 + b'1' + b']' * 2000, common.JSONError),
+    (b'{"a":' * 2000 + b'1' + b'}' * 2000, common.JSONError),
+]
+
+
+class PythonErrorConditions(unittest.TestCase):
+    '''
+    Error-handling tests specific to the pure python backend. Every failure
+    mode must be reported as JSONError or its IncompleteJSONError subclass,
+    and behave identically at the basic_parse/parse/items layers.
+    '''
+    backend = import_module('ijson.backends.python')
+
+    def test_exception_types(self):
+        for data, expected in PYTHON_ERROR_CASES:
+            for consume in (
+                lambda: list(self.backend.basic_parse(BytesIO(data))),
+                lambda: list(self.backend.parse(BytesIO(data))),
+                lambda: list(self.backend.items(BytesIO(data), 'item')),
+            ):
+                # exact type asserted first...
+                self.assertRaises(expected, consume)
+                # ...and every error must be catchable as JSONError
+                with self.assertRaises(common.JSONError):
+                    consume()
+
+    def test_no_foreign_exceptions_leak(self):
+        foreign = (UnicodeDecodeError, ValueError, RecursionError)
+        for data, _ in PYTHON_ERROR_CASES:
+            for consume in (
+                lambda: list(self.backend.basic_parse(BytesIO(data))),
+                lambda: list(self.backend.parse(BytesIO(data))),
+                lambda: list(self.backend.items(BytesIO(data), 'item')),
+            ):
+                try:
+                    consume()
+                except foreign:
+                    self.fail('%r raised a foreign exception' % data)
+                except common.JSONError:
+                    pass
+
+    def test_invalid_numbers_rejected(self):
+        for data in (b'[+1]', b'[01]', b'[1.]', b'[nan]', b'[Infinity]',
+                     b'[1e]', b'[-01]', b'[00]'):
+            with self.assertRaises(common.JSONError):
+                list(self.backend.basic_parse(BytesIO(data)))
+
+    def test_valid_numbers_kept(self):
+        events = list(self.backend.basic_parse(
+            BytesIO(b'[1, 1.0, 1E2, 1.0e+2]')
+        ))
+        numbers = [value for event, value in events if event == 'number']
+        for number in numbers:
+            self.assertIn(type(number), (int, Decimal))
+        self.assertEqual(numbers[0], 1)
+        self.assertEqual(numbers[3], 100)
+
+    def test_lazy_construction_does_not_raise(self):
+        for data, _ in PYTHON_ERROR_CASES:
+            # iterators must not fail before they are consumed
+            self.backend.basic_parse(BytesIO(data))
+            self.backend.parse(BytesIO(data))
+            self.backend.items(BytesIO(data), 'item')
+
+    def test_records_before_bad_record_are_delivered(self):
+        data = b'[{"a": 1}, {"b": 2}, {"c": nan}, {"d": 3}]'
+
+        events = []
+        with self.assertRaises(common.JSONError):
+            for event in self.backend.basic_parse(BytesIO(data)):
+                events.append(event)
+        self.assertIn(('map_key', 'a'), events)
+        self.assertIn(('map_key', 'b'), events)
+        # the record following the bad one must never be reached
+        self.assertNotIn(('map_key', 'd'), events)
+
+        prefixed = []
+        with self.assertRaises(common.JSONError):
+            for event in self.backend.parse(BytesIO(data)):
+                prefixed.append(event)
+        self.assertIn(('item', 'map_key', 'b'), prefixed)
+
+        values = []
+        with self.assertRaises(common.JSONError):
+            for value in self.backend.items(BytesIO(data), 'item'):
+                values.append(value)
+        self.assertEqual(values, [{'a': 1}, {'b': 2}])
+
+    def test_nesting_limit(self):
+        limit = self.backend.JSON_MAX_DEPTH
+        # exactly at the limit is still accepted
+        list(self.backend.basic_parse(
+            BytesIO(b'[' * limit + b'1' + b']' * limit)
+        ))
+        # one level deeper is a parse error, not a RecursionError
+        with self.assertRaises(common.JSONError):
+            list(self.backend.basic_parse(
+                BytesIO(b'[' * (limit + 1) + b'1' + b']' * (limit + 1))
+            ))
+        with self.assertRaises(common.JSONError):
+            list(self.backend.basic_parse(
+                BytesIO(b'{"a":' * (limit + 1) + b'1' + b'}' * (limit + 1))
+            ))
+
+
 if __name__ == '__main__':
     unittest.main()

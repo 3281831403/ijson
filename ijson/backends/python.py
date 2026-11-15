@@ -13,6 +13,22 @@ from ijson.compat import bytetype
 
 BUFSIZE = 16 * 1024
 LEXEME_RE = re.compile(r'[a-z0-9eE\.\+-]+|\S')
+# Same number grammar as the one used by the stdlib json module: no leading
+# zeroes, no leading '+', no trailing dot or empty exponent...
+NUMBER_RE = re.compile(
+    r'(-?(?:0|[1-9]\d*))(\.\d+)?([eE][-+]?\d+)?\Z'
+)
+# Maximum nesting depth of arrays and objects. Deeper structures are rejected
+# with a JSONError instead of blowing the Python recursion limit.
+JSON_MAX_DEPTH = 100
+
+# Proper prefixes of the literal keywords. A lexeme cut off at EOF that is one
+# of these means truncated data rather than garbage input.
+_LITERAL_PREFIXES = {
+    word[:i]
+    for word in ('null', 'true', 'false')
+    for i in range(1, len(word))
+}
 
 
 class UnexpectedSymbol(common.JSONError):
@@ -25,7 +41,17 @@ class UnexpectedSymbol(common.JSONError):
 def Lexer(f, buf_size=BUFSIZE):
     if type(f.read(0)) == bytetype:
         f = getreader('utf-8')(f)
-    buf = f.read(buf_size)
+
+    def read():
+        # A malformed UTF-8 stream is a parse error, not an arbitrary codec
+        # exception. Truncated multibyte sequences at EOF surface below as
+        # incomplete string lexemes.
+        try:
+            return f.read(buf_size)
+        except UnicodeDecodeError as e:
+            raise common.JSONError(e)
+
+    buf = read()
     pos = 0
     discarded = 0
     while True:
@@ -46,7 +72,7 @@ def Lexer(f, buf_size=BUFSIZE):
                         else:
                             break
                     except ValueError:
-                        data = f.read(buf_size)
+                        data = read()
                         if not data:
                             raise common.IncompleteJSONError('Incomplete string lexeme')
                         buf += data
@@ -54,7 +80,7 @@ def Lexer(f, buf_size=BUFSIZE):
                 pos = end + 1
             else:
                 while match.end() == len(buf):
-                    data = f.read(buf_size)
+                    data = read()
                     if not data:
                         break
                     buf += data
@@ -63,7 +89,7 @@ def Lexer(f, buf_size=BUFSIZE):
                 yield discarded + match.start(), lexeme
                 pos = match.end()
         else:
-            data = f.read(buf_size)
+            data = read()
             if not data:
                 break
             discarded += len(buf)
@@ -71,7 +97,7 @@ def Lexer(f, buf_size=BUFSIZE):
             pos = 0
 
 
-def parse_value(lexer, symbol=None, pos=0):
+def parse_value(lexer, symbol=None, pos=0, depth=0):
     try:
         if symbol is None:
             pos, symbol = next(lexer)
@@ -82,19 +108,31 @@ def parse_value(lexer, symbol=None, pos=0):
         elif symbol == 'false':
             yield ('boolean', False)
         elif symbol == '[':
-            for event in parse_array(lexer):
+            for event in parse_array(lexer, depth + 1):
                 yield event
         elif symbol == '{':
-            for event in parse_object(lexer):
+            for event in parse_object(lexer, depth + 1):
                 yield event
         elif symbol[0] == '"':
-            yield ('string', parse_string(symbol))
+            try:
+                yield ('string', parse_string(symbol))
+            except ValueError as e:
+                # Bad escapes and bare control characters are parse errors.
+                raise common.JSONError(e)
         else:
+            if symbol in _LITERAL_PREFIXES:
+                # A cut-off beginning of null/true/false: the stream ends
+                # before the keyword is complete.
+                raise common.IncompleteJSONError('Incomplete JSON data')
+            if not NUMBER_RE.match(symbol):
+                raise UnexpectedSymbol(symbol, pos)
             try:
                 yield ('number', common.number(symbol))
             except decimal.InvalidOperation:
                 raise UnexpectedSymbol(symbol, pos)
     except StopIteration:
+        # PEP 479: a generator must not let StopIteration escape. Reading
+        # past the end while a value is expected means incomplete data.
         raise common.IncompleteJSONError('Incomplete JSON data')
 
 
@@ -102,13 +140,17 @@ def parse_string(symbol):
     return scanstring(symbol, 1)[0]
 
 
-def parse_array(lexer):
+def parse_array(lexer, depth=1):
+    if depth > JSON_MAX_DEPTH:
+        raise common.JSONError(
+            'JSON nesting limit %d exceeded' % JSON_MAX_DEPTH
+        )
     yield ('start_array', None)
     try:
         pos, symbol = next(lexer)
         if symbol != ']':
             while True:
-                for event in parse_value(lexer, symbol, pos):
+                for event in parse_value(lexer, symbol, pos, depth):
                     yield event
                 pos, symbol = next(lexer)
                 if symbol == ']':
@@ -121,7 +163,11 @@ def parse_array(lexer):
         raise common.IncompleteJSONError('Incomplete JSON data')
 
 
-def parse_object(lexer):
+def parse_object(lexer, depth=1):
+    if depth > JSON_MAX_DEPTH:
+        raise common.JSONError(
+            'JSON nesting limit %d exceeded' % JSON_MAX_DEPTH
+        )
     yield ('start_map', None)
     try:
         pos, symbol = next(lexer)
@@ -129,11 +175,15 @@ def parse_object(lexer):
             while True:
                 if symbol[0] != '"':
                     raise UnexpectedSymbol(symbol, pos)
-                yield ('map_key', parse_string(symbol))
+                try:
+                    yield ('map_key', parse_string(symbol))
+                except ValueError as e:
+                    # Bad escapes and bare control characters are parse errors.
+                    raise common.JSONError(e)
                 pos, symbol = next(lexer)
                 if symbol != ':':
                     raise UnexpectedSymbol(symbol, pos)
-                for event in parse_value(lexer, None, pos):
+                for event in parse_value(lexer, None, pos, depth):
                     yield event
                 pos, symbol = next(lexer)
                 if symbol == '}':
